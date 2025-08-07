@@ -1,0 +1,16 @@
+../Core/Src/main.c:98:5:main	1
+../Core/Src/main.c:149:6:SystemClock_Config	4
+../Core/Src/main.c:204:13:MX_SAI2_Init	2
+../Core/Src/main.c:252:13:MX_USART3_UART_Init	2
+../Core/Src/main.c:285:13:MX_DMA_Init	1
+../Core/Src/main.c:307:13:MX_GPIO_Init	1
+../Core/Src/main.c:408:9:convert_24bit_to_signed	2
+../Core/Src/main.c:420:9:UART_Queue_IsFull	1
+../Core/Src/main.c:425:9:UART_Queue_IsEmpty	1
+../Core/Src/main.c:430:6:UART_Queue_Push	3
+../Core/Src/main.c:447:6:UART_Transmit_Next	2
+../Core/Src/main.c:459:6:Process_Audio_Chunk	3
+../Core/Src/main.c:480:6:HAL_SAI_RxHalfCpltCallback	2
+../Core/Src/main.c:488:6:HAL_SAI_RxCpltCallback	2
+../Core/Src/main.c:500:6:HAL_UART_TxCpltCallback	2
+../Core/Src/main.c:527:6:Error_Handler	1

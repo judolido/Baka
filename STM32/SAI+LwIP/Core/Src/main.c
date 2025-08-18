@@ -1,28 +1,39 @@
+
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file           : main.c
+  * @file           : main.c (LwIP UDP audio sender)
   * @brief          : Main program body
   ******************************************************************************
-  * @attention
+  * NOTE: This file was adapted to send audio via UDP using LwIP.
+  * - SAI + DMA captures 24-bit audio in 32-bit slots.
+  * - An ISR pushes raw samples into a lock-free ring buffer.
+  * - The main loop pumps LwIP and sends UDP packets of 480 samples
+  *   (1440-byte payload) with a small 8-byte header.
   *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
+  * Packet format (little-endian):
+  *   [0]   0xAA
+  *   [1]   0x55
+  *   [2]   seq (u8)
+  *   [3]   flags (u8, reserved=0)
+  *   [4:7] timestamp/sample_counter (u32, increases by 480 per packet)
+  *   [8:]  480 * PCM24 {LSB, Mid, MSB}
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * Set DEST_IP_STR below to your PC's IPv4 address (or a subnet broadcast).
   ******************************************************************************
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "lwip.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
+#include "lwip.h"
+#include "lwip/udp.h"
+#include "lwip/pbuf.h"
+#include "lwip/ip_addr.h"
+#include "lwip/netif.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -32,6 +43,21 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define AUDIO_BUFFER_SIZE     2048   // DMA buffer words (32-bit per sample)
+
+// ---- LwIP/UDP config ----
+#define DEST_IP_STR           "192.168.1.100"   // <-- set to your PC's IP or "255.255.255.255" for broadcast
+#define DEST_UDP_PORT         5004
+#define SAMPLES_PER_PKT       480               // 480 * 3 = 1440B payload fits under 1472B UDP MTU
+#define UDP_HDR_SIZE          8
+#define UDP_PAYLOAD_SIZE      (SAMPLES_PER_PKT*3)
+#define UDP_PKT_SIZE          (UDP_HDR_SIZE + UDP_PAYLOAD_SIZE)
+
+// ---- Audio ring buffer (32-bit words from SAI) ----
+#define RING_ORDER            14                // 2^14 = 16384 samples (~64KB)
+#define RING_SIZE             (1U << RING_ORDER)
+#define RING_MASK             (RING_SIZE - 1U)
 
 /* USER CODE END PD */
 
@@ -45,41 +71,22 @@
 SAI_HandleTypeDef hsai_BlockB2;
 DMA_HandleTypeDef hdma_sai2_b;
 
-UART_HandleTypeDef huart3;
-DMA_HandleTypeDef hdma_usart3_tx;
-
 /* USER CODE BEGIN PV */
 
-// char uart_tx_buffer[64];     // UART transmission buffer
-//#define AUDIO_BUFF_SIZE 32
-//static volatile uint32_t pAudBuf[AUDIO_BUFF_SIZE];
-//static volatile uint8_t audio_out_buffer[AUDIO_BUFF_SIZE*3];
+// DMA buffer for SAI
+uint32_t sai_dma_buffer[AUDIO_BUFFER_SIZE];
 
+// Audio ring written in ISR, read in main loop
+static volatile uint32_t audio_ring[RING_SIZE];
+static volatile uint32_t ring_wr = 0;
+static volatile uint32_t ring_rd = 0;
 
-#define AUDIO_BUFF_SIZE 1024  // For example (must be even)
-#define HALF_AUDIO_SIZE (AUDIO_BUFF_SIZE / 2)
-#define BYTES_PER_SAMPLE 3
-
-uint32_t pAudBuf[AUDIO_BUFF_SIZE];  // DMA audio buffer
-
-// Double UART buffer: 2 halves (half-buffer * 3 bytes)
-#define AUDIO_UART_CHUNK ((AUDIO_BUFF_SIZE / 2) * 3)
-
-uint8_t audio_out_buffer[2][AUDIO_UART_CHUNK];  // Double buffer
-volatile uint8_t current_uart_buf = 0;          // 0 or 1
-
-// Track which half is being used
-volatile uint8_t uart_dma_busy = 0;
-volatile uint8_t uart_tx_pending_half = 0xFF;
-
-#define UART_TX_BLOCK_SIZE  (AUDIO_BUFF_SIZE / 2 * 3)  // 24-bit mono
-#define UART_TX_BUFFERS     2
-
-uint8_t uart_tx_buffer[UART_TX_BUFFERS][UART_TX_BLOCK_SIZE];
-volatile uint8_t uart_tx_busy = 0;
-volatile uint8_t uart_tx_index = 0;
-
-
+// UDP state
+static struct udp_pcb *g_udp = NULL;
+static ip_addr_t g_dest_ip;
+static uint8_t  g_seq = 0;
+static uint32_t g_sample_counter = 0;
+static uint8_t  g_udp_buf[UDP_PKT_SIZE];
 
 /* USER CODE END PV */
 
@@ -87,14 +94,42 @@ volatile uint8_t uart_tx_index = 0;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
-static void MX_USART3_UART_Init(void);
 static void MX_SAI2_Init(void);
-/* USER CODE BEGIN PFP */
 
+/* USER CODE BEGIN PFP */
+static void Net_Init(void);
+static void UDP_Send_Pump(void);
+static inline void push_samples_to_ring(const uint32_t *src, uint16_t count);
+static inline void pack24le(uint8_t *dst3, uint32_t w);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+extern struct netif gnetif; // declared by CubeMX in lwip.c
+
+static inline void pack24le(uint8_t *dst3, uint32_t w)
+{
+  // SAI gives 24-bit signed left-justified in 32-bit slot
+  // Keep sign, shift down 8, then write little-endian 24-bit
+  int32_t s = (int32_t)w;
+  uint32_t v = ((uint32_t)s) >> 8;
+  dst3[0] = (uint8_t)(v & 0xFF);
+  dst3[1] = (uint8_t)((v >> 8) & 0xFF);
+  dst3[2] = (uint8_t)((v >> 16) & 0xFF);
+}
+
+static inline void push_samples_to_ring(const uint32_t *src, uint16_t count)
+{
+  for (uint16_t i = 0; i < count; ++i) {
+    audio_ring[ring_wr & RING_MASK] = src[i];
+    ring_wr++;
+    // Optional: drop oldest on overflow (keep ring within 1*RING_SIZE window)
+    if ((ring_wr - ring_rd) > RING_SIZE) {
+      ring_rd = ring_wr - RING_SIZE;
+    }
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -104,82 +139,115 @@ static void MX_SAI2_Init(void);
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-HAL_Delay(10);
-  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_USART3_UART_Init();
   MX_SAI2_Init();
-  MX_LWIP_Init();
+
   /* USER CODE BEGIN 2 */
+  // Start audio capture
+  HAL_SAI_Receive_DMA(&hsai_BlockB2, (uint8_t *)sai_dma_buffer, 2 * AUDIO_BUFFER_SIZE);
 
-   //HAL_SAI_Receive(&hsai_BlockA1, data, 1, 50);
-  // HAL_SAI_Receive_DMA(&hsai_BlockA1, data, 5);
-   //HAL_UART_Transmit(&huart3, data, 5, 100);
-
-
-
+  // Bring up LwIP/Ethernet and UDP socket
+  Net_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  HAL_Delay(100);
-  HAL_SAI_Receive_DMA(&hsai_BlockB2, (uint8_t*)pAudBuf, AUDIO_BUFF_SIZE);
-  uint32_t last_uart_tx_time = HAL_GetTick();
-
-  //HAL_SAI_Receive(&hsai_BlockB2, (uint16_t*)i2s_rx_buffer, 2, 100);
-  // Set guard value after audio buffer
   while (1)
   {
+    // Run LwIP background tasks (NO_SYS=1)
+    MX_LWIP_Process();
 
+    // Send as many UDP packets as available in the ring
+    UDP_Send_Pump();
 
-/*
-	  if ((HAL_GetTick() - last_uart_tx_time) >= 10)
-	      {
-	          // Build a formatted string from DMA buffer (first few samples)
-	          int len = 0;
-	          for (int i = 0; i < 1 && i < AUDIO_BUFF_SIZE; ++i)  // Send first 10 samples
-	          {
-	        	  int32_t sample = (pAudBuf[i] & 0x800000) ? (pAudBuf[i] | 0xFF000000) : (pAudBuf[i] & 0x00FFFFFF);
-	        	 // uint32_t sample = pAudBuf[i] & 0x00FFFFFF;  // Mask only lower 24 bits
-
-	        	  len += snprintf(uart_tx_buffer + len, sizeof(uart_tx_buffer) - len, "%ld ", sample);
-	          }
-	          uart_tx_buffer[len++] = '\r';
-	          uart_tx_buffer[len++] = '\n';
-
-	          // Send over UART
-	          HAL_UART_Transmit(&huart3, (uint8_t*)uart_tx_buffer, len, HAL_MAX_DELAY);
-
-	          last_uart_tx_time = HAL_GetTick();  // reset timer
-	      }
-
-*/
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
+    // Optional: small sleep to reduce CPU usage
+    // HAL_Delay(1);
   }
-  /* USER CODE END 3 */
+}
+
+/**
+  * @brief Bring up LwIP and connect UDP PCB
+  */
+static void Net_Init(void)
+{
+  MX_LWIP_Init();
+
+  // Wait until netif is up and has a valid IPv4
+  while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) {
+    MX_LWIP_Process();
+    HAL_Delay(10);
+  }
+
+  g_udp = udp_new();
+  if (!g_udp) {
+    Error_Handler();
+  }
+
+  // Destination IP
+  if (!ipaddr_aton(DEST_IP_STR, &g_dest_ip)) {
+    Error_Handler();
+  }
+
+  udp_connect(g_udp, &g_dest_ip, DEST_UDP_PORT);
+
+  // If you set DEST_IP_STR to a broadcast address, uncomment:
+  // udp_set_flags(g_udp, UDP_FLAGS_BROADCAST);
+}
+
+/**
+  * @brief Send UDP packets while enough samples exist in the ring
+  */
+static void UDP_Send_Pump(void)
+{
+  while ((ring_wr - ring_rd) >= SAMPLES_PER_PKT) {
+    // Header
+    uint8_t *p = g_udp_buf;
+    *p++ = 0xAA;
+    *p++ = 0x55;
+    *p++ = g_seq++;
+    *p++ = 0x00; // flags
+    uint32_t ts = g_sample_counter;
+    memcpy(p, &ts, sizeof(ts));
+    p += 4;
+
+    // Payload: 480 samples -> 1440 bytes
+    for (int i = 0; i < SAMPLES_PER_PKT; ++i) {
+      uint32_t w = audio_ring[ring_rd & RING_MASK];
+      ring_rd++;
+      pack24le(p, w);
+      p += 3;
+    }
+    g_sample_counter += SAMPLES_PER_PKT;
+
+    // Send
+    struct pbuf *pb = pbuf_alloc(PBUF_TRANSPORT, UDP_PKT_SIZE, PBUF_RAM);
+    if (!pb) {
+      // Out of buffers—drop this packet (next loop will try again)
+      return;
+    }
+    memcpy(pb->payload, g_udp_buf, UDP_PKT_SIZE);
+    udp_send(g_udp, pb);
+    pbuf_free(pb);
+  }
+}
+
+/* SAI DMA callbacks: push half/full buffers into ring */
+void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai)
+{
+  if (hsai->Instance == SAI2_Block_B) {
+    push_samples_to_ring(&sai_dma_buffer[0], AUDIO_BUFFER_SIZE / 2);
+  }
+}
+void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
+{
+  if (hsai->Instance == SAI2_Block_B) {
+    push_samples_to_ring(&sai_dma_buffer[AUDIO_BUFFER_SIZE / 2], AUDIO_BUFFER_SIZE / 2);
+  }
 }
 
 /**
@@ -191,14 +259,9 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -209,20 +272,14 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 2;
   RCC_OscInitStruct.PLL.PLLR = 2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
-  /** Activate the Over-Drive mode
-  */
-  if (HAL_PWREx_EnableOverDrive() != HAL_OK)
-  {
+  if (HAL_PWREx_EnableOverDrive() != HAL_OK) {
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -230,8 +287,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_7) != HAL_OK) {
     Error_Handler();
   }
 }
@@ -243,14 +299,6 @@ void SystemClock_Config(void)
   */
 static void MX_SAI2_Init(void)
 {
-
-  /* USER CODE BEGIN SAI2_Init 0 */
-
-  /* USER CODE END SAI2_Init 0 */
-
-  /* USER CODE BEGIN SAI2_Init 1 */
-
-  /* USER CODE END SAI2_Init 1 */
   hsai_BlockB2.Instance = SAI2_Block_B;
   hsai_BlockB2.Init.Protocol = SAI_FREE_PROTOCOL;
   hsai_BlockB2.Init.AudioMode = SAI_MODEMASTER_RX;
@@ -261,7 +309,7 @@ static void MX_SAI2_Init(void)
   hsai_BlockB2.Init.OutputDrive = SAI_OUTPUTDRIVE_DISABLE;
   hsai_BlockB2.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
   hsai_BlockB2.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
-  hsai_BlockB2.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_32K;
+  hsai_BlockB2.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_22K; // adjust to 32K in CubeMX if desired
   hsai_BlockB2.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
   hsai_BlockB2.Init.MonoStereoMode = SAI_STEREOMODE;
   hsai_BlockB2.Init.CompandingMode = SAI_NOCOMPANDING;
@@ -274,49 +322,9 @@ static void MX_SAI2_Init(void)
   hsai_BlockB2.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
   hsai_BlockB2.SlotInit.SlotNumber = 2;
   hsai_BlockB2.SlotInit.SlotActive = 0x00000001;
-  if (HAL_SAI_Init(&hsai_BlockB2) != HAL_OK)
-  {
+  if (HAL_SAI_Init(&hsai_BlockB2) != HAL_OK) {
     Error_Handler();
   }
-  /* USER CODE BEGIN SAI2_Init 2 */
-
-  /* USER CODE END SAI2_Init 2 */
-
-}
-
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART3_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART3_Init 0 */
-
-  /* USER CODE END USART3_Init 0 */
-
-  /* USER CODE BEGIN USART3_Init 1 */
-
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 1500000;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART3_Init 2 */
-
-  /* USER CODE END USART3_Init 2 */
-
 }
 
 /**
@@ -324,19 +332,12 @@ static void MX_USART3_UART_Init(void)
   */
 static void MX_DMA_Init(void)
 {
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA2_CLK_ENABLE();
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
-  /* DMA1_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
-  /* DMA2_Stream1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
-
 }
 
 /**
@@ -347,11 +348,7 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -360,131 +357,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD3_Pin|LD2_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : USER_Btn_Pin */
   GPIO_InitStruct.Pin = USER_Btn_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LD1_Pin LD3_Pin LD2_Pin */
+  // Ethernet pins configured by CubeMX
+
   GPIO_InitStruct.Pin = LD1_Pin|LD3_Pin|LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : USB_PowerSwitchOn_Pin */
-  GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : USB_OverCurrent_Pin */
-  GPIO_InitStruct.Pin = USB_OverCurrent_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : USB_SOF_Pin USB_ID_Pin USB_DM_Pin USB_DP_Pin */
-  GPIO_InitStruct.Pin = USB_SOF_Pin|USB_ID_Pin|USB_DM_Pin|USB_DP_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF10_OTG_FS;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : USB_VBUS_Pin */
-  GPIO_InitStruct.Pin = USB_VBUS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(USB_VBUS_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
-
-/* USER CODE BEGIN 4 */
-/*
-void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef * hsai) {
-  for (int i = AUDIO_BUFF_SIZE / 2; i < AUDIO_BUFF_SIZE; i++) {
-    audio_out_buffer[(i - AUDIO_BUFF_SIZE / 2) * 3 + 2] = (uint8_t)(pAudBuf[i] >> 16);
-    audio_out_buffer[(i - AUDIO_BUFF_SIZE / 2) * 3 + 1] = (uint8_t)(pAudBuf[i] >> 8);
-    audio_out_buffer[(i - AUDIO_BUFF_SIZE / 2) * 3 + 0] = (uint8_t)(pAudBuf[i]);
-  }
-  HAL_UART_Transmit(&huart3, audio_out_buffer, (AUDIO_BUFF_SIZE / 2) * 3, HAL_MAX_DELAY);
-}
-
-void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef * hsai) {
-  for (int i = 0; i < AUDIO_BUFF_SIZE / 2; i++) {
-    audio_out_buffer[i * 3 + 2] = (uint8_t)(pAudBuf[i] >> 16);
-    audio_out_buffer[i * 3 + 1] = (uint8_t)(pAudBuf[i] >> 8);
-    audio_out_buffer[i * 3 + 0] = (uint8_t)(pAudBuf[i]);
-  }
-  HAL_UART_Transmit(&huart3, audio_out_buffer, (AUDIO_BUFF_SIZE / 2) * 3, HAL_MAX_DELAY);
-}
-
-
-*/
-
-void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai) {
-    uint8_t* tx_buf = audio_out_buffer[current_uart_buf];
-
-    for (int i = 0; i < AUDIO_BUFF_SIZE / 2; i++) {
-        tx_buf[i * 3 + 2] = (uint8_t)(pAudBuf[i] >> 16);
-        tx_buf[i * 3 + 1] = (uint8_t)(pAudBuf[i] >> 8);
-        tx_buf[i * 3 + 0] = (uint8_t)(pAudBuf[i]);
-    }
-
-    if (!uart_dma_busy) {
-        uart_dma_busy = 1;
-        HAL_UART_Transmit_DMA(&huart3, tx_buf, AUDIO_UART_CHUNK);
-        current_uart_buf ^= 1;  // Toggle buffer (0 → 1, 1 → 0)
-    }
-}
-
-
-void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai) {
-    uint8_t* tx_buf = audio_out_buffer[current_uart_buf];
-
-    for (int i = AUDIO_BUFF_SIZE / 2; i < AUDIO_BUFF_SIZE; i++) {
-        int j = i - AUDIO_BUFF_SIZE / 2;
-        tx_buf[j * 3 + 2] = (uint8_t)(pAudBuf[i] >> 16);
-        tx_buf[j * 3 + 1] = (uint8_t)(pAudBuf[i] >> 8);
-        tx_buf[j * 3 + 0] = (uint8_t)(pAudBuf[i]);
-    }
-
-    if (!uart_dma_busy) {
-        uart_dma_busy = 1;
-        HAL_UART_Transmit_DMA(&huart3, tx_buf, AUDIO_UART_CHUNK);
-        current_uart_buf ^= 1;  // Toggle buffer
-    }
-}
-
-
-
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART3) {
-        uart_dma_busy = 0;
-    }
-}
-
-
-
-
-
-
-
-
-/* USER CODE END 4 */
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -492,27 +381,12 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+  while (1) { }
 }
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
+
+#ifdef  USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

@@ -1,4 +1,0 @@
-This is a collection of ~100 samples of each type of defect.
-One sample contains 96000 values (3 seconds with sample rate = 32Khz ("hearable" 16Khz respectively) )
-First row - Time (s)
-Second row - 24bit signed value (MSB - sign)
